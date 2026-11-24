@@ -7,18 +7,32 @@
 * 只更新分支（refs/heads/*），标签等其它引用一律忽略；
 * 仓库与各包中的同名分支必须能排成同一条快进链，生效后指向链尾；
 * 验包在带 alternates 的隔离仓库里进行：照常读取现行分支，不复制已有对象库；
+  隔离目录由 TMPDIR 指定（默认系统临时目录）；
 * 全部包通过校验后才一起更新涉及的分支；验包期间分支已变或任一包校验失败，
   整批退回，仓库里已生效的分支保持原状。
+
+对象迁入（不重新打包，复用验包生成的对象文件）：
+
+* 验包时 ``git fetch`` 进隔离库产生的 pack/松散对象文件，就是迁入正式库的来源，
+  不再对 bundle 或隔离库二次打包；
+* 隔离目录与正式库在同一文件系统时，用硬链接把对象文件装进正式库，磁盘上只有
+  一份数据；跨文件系统（``EXDEV``）时回退为复制对象文件；
+* 正式库中已存在的对象文件一律跳过，绝不覆盖或删除；
+* 更新分支前，正式库必须能脱离隔离库自行读全本批分支可达的全部对象
+  （提交、树、文件 blob）；迁入出错、自检缺对象或分支更新事务被拒，本批不发布，
+  撤回本批新增的全部正式对象文件。
+
+前提：本服务单进程写库，不与外部写库或对象回收（gc）并行。
 """
 from __future__ import annotations
 
+import errno
 import os
 import re
 import shutil
 import subprocess
 import tempfile
 import threading
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -34,7 +48,8 @@ SAMPLES_BAD_DIR = os.environ.get("SAMPLES_BAD_DIR", "")
 MAX_BUNDLES = 6
 ZERO_SHA = "0" * 40
 HEADS_PREFIX = "refs/heads/"
-TMP_REFS_PREFIX = "refs/import/"  # 对象迁入正式库时使用的临时引用空间
+# 迁入正式库时认可的对象文件后缀（objects/pack/ 内）
+PACK_SUFFIXES = (".pack", ".idx", ".rev", ".keep")
 
 app = FastAPI(title="Git bundle 批量导入")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -89,6 +104,136 @@ def is_ancestor(repo, old, new):
     """old 是否为 new 的祖先（对象不存在时视为否）。"""
     return git(repo, "merge-base", "--is-ancestor", old, new,
                check=False).returncode == 0
+
+
+# --------------------------------------------------------------------------
+# 对象迁入：复用隔离库验包生成的对象文件，不重新打包
+# --------------------------------------------------------------------------
+
+def reachable_object_shas(repo, tips):
+    """一组尖端提交可达的全部对象 sha（提交、树、标签、文件 blob）。"""
+    proc = git(repo, "rev-list", "--objects", *tips)
+    return {line.split(" ", 1)[0]
+            for line in proc.stdout.splitlines() if line}
+
+
+def missing_objects_locally(repo, tips):
+    """正式库不借助任何 alternate 时，读不到的对象 sha 列表。
+
+    本服务从不给正式库配置 alternates；若发现正式库自带 alternates，
+    直接报错，避免把“借隔离库读到对象”误判成正式库已具备该对象。
+    """
+    alt_file = os.path.join(repo, "objects", "info", "alternates")
+    if os.path.exists(alt_file):
+        raise GitError(["cat-file"],
+                       f"正式库存在 alternates（{alt_file}），"
+                       "拒绝在借用外部对象库的情况下发布。")
+    shas = sorted(reachable_object_shas(repo, tips))
+    if not shas:
+        return []
+    env = {**os.environ, "GIT_ALTERNATE_OBJECT_DIRECTORIES": ""}
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "--batch-check"],
+        input="\n".join(shas) + "\n", capture_output=True, text=True, env=env)
+    if proc.returncode != 0:
+        raise GitError(["cat-file", "--batch-check"], proc.stderr.strip())
+    missing = []
+    for line in proc.stdout.splitlines():
+        parts = line.rsplit(" ", 1)
+        if len(parts) == 2 and parts[1] == "missing":
+            missing.append(parts[0])
+    return missing
+
+
+def _link_or_copy(src, dst, installed, skipped):
+    """把单个对象文件装进正式库：已存在则跳过；优先硬链接，跨文件系统则复制。"""
+    if dst.exists():
+        skipped.append(str(dst))
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    # 先登记：即便落盘动作本身抛异常（如复制中途 EIO），回滚也能找到半截文件。
+    # 失败时就地清理本文件并撤销本条登记；此前已成功的登记必须保留给回滚。
+    installed.append(str(dst))
+    try:
+        os.link(src, dst)  # 同一文件系统：只加目录项，不写第二份数据
+    except FileExistsError:
+        installed.pop()
+        skipped.append(str(dst))
+        return
+    except OSError as exc:
+        if exc.errno not in (errno.EXDEV, errno.EPERM, errno.EMLINK):
+            dst.unlink(missing_ok=True)
+            installed.pop()
+            raise
+        # 跨文件系统（EXDEV）或硬链接不可用：回退为复制对象文件
+        try:
+            shutil.copyfile(src, dst)
+        except BaseException:
+            dst.unlink(missing_ok=True)  # 不留半截文件，避免后续被误判为已存在
+            installed.pop()
+            raise
+
+
+def install_quarantine_objects(q_repo, repo, installed=None):
+    """把隔离库验包产生的对象文件装入正式库，返回 (本批新增路径, 已存在跳过路径)。
+
+    只搬运 git 对象文件：``objects/xx/<38hex>`` 松散对象与
+    ``objects/pack/`` 下的 pack/idx（及 rev/keep）；``objects/info`` 不动。
+    正式库已有同名文件一律跳过，不覆盖、不删除。
+
+    ``installed`` 由调用方传入并持有（累加器）：安装中途即便抛异常，调用方
+    仍能凭该清单逐个撤回；返回值里的新增清单与它是同一个列表。
+    """
+    q_obj = Path(q_repo) / "objects"
+    r_obj = Path(repo) / "objects"
+    if installed is None:
+        installed = []
+    skipped = []
+
+    for shard in sorted(q_obj.iterdir()):
+        # 仅认两位十六进制的松散对象分片目录；pack/、info/ 另行处理
+        if not (shard.is_dir() and len(shard.name) == 2
+                and re.fullmatch(r"[0-9a-f]{2}", shard.name)):
+            continue
+        target_dir = r_obj / shard.name
+        for src in sorted(shard.iterdir()):
+            if src.is_file():
+                _link_or_copy(src, target_dir / src.name, installed, skipped)
+
+    q_pack = q_obj / "pack"
+    if q_pack.is_dir():
+        r_pack = r_obj / "pack"
+        for src in sorted(q_pack.iterdir()):
+            if src.is_file() and src.suffix in PACK_SUFFIXES:
+                _link_or_copy(src, r_pack / src.name, installed, skipped)
+
+    return installed, skipped
+
+
+def rollback_installed(installed):
+    """撤回本批新增的正式对象文件，并清理因此变空的对象分片目录。
+
+    只删本批记录在案的新文件；正式库原有文件从未被覆盖或删除，此处也碰不到。
+    删除顺序很重要：先删全部 ``.idx`` 再删 ``.pack``，这样即使回滚被信号打断，
+    仓库里也不会留下“pack 与 idx 成对完整”的包被 git 自动发现而复活。
+    """
+    def _unlink(path):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+    idx_files = [p for p in installed if p.endswith(".idx")]
+    other_files = [p for p in installed if not p.endswith(".idx")]
+    for path in idx_files:
+        _unlink(path)
+    for path in other_files:
+        _unlink(path)
+    for d in sorted({os.path.dirname(p) for p in installed}, reverse=True):
+        try:
+            os.rmdir(d)  # 仅当目录已空才删除，pack/ 等非空目录原样保留
+        except OSError:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -174,7 +319,7 @@ def import_bundles(repo, files):
 
     with import_lock:
         work = tempfile.mkdtemp(prefix="bundle-import-")
-        tmp_refs_created = False
+        installed = []  # 本批在正式库新增的对象文件（失败时逐个撤回）
         try:
             # 1) 落盘并解析包头
             bundles = []
@@ -302,11 +447,33 @@ def import_bundles(repo, files):
                 result["unchanged"] = unchanged
                 return result
 
-            # 6) 全部通过：对象迁入正式库（临时引用空间），再一次性更新分支
-            batch = uuid.uuid4().hex[:12]
-            git(repo, "fetch", "--no-tags", "--", q,
-                f"+refs/q/*:{TMP_REFS_PREFIX}{batch}/*")
-            tmp_refs_created = True
+            # 6) 全部通过：把验包生成的对象文件装入正式库（同文件系统硬链接、
+            #    跨文件系统复制，均不重新打包），自检正式库脱离隔离库可读全对象，
+            #    最后用 update-ref 事务（带原值校验）一次性更新分支。
+            final_tips = {u["new"] for u in updates}
+            final_tips.update(
+                sha for sha in (snapshot0.get(HEADS_PREFIX + b)
+                                for b in unchanged) if sha)
+            try:
+                # installed 是外层持有的累加器：安装中途异常也不丢清单，
+                # except/finally 都能凭它撤回本批已装入的对象文件。
+                install_quarantine_objects(q, repo, installed)
+                missing_local = missing_objects_locally(repo, sorted(final_tips))
+                if missing_local:
+                    raise GitError(
+                        ["cat-file"],
+                        "正式库仍缺少 " + str(len(missing_local))
+                        + " 个本批分支所需对象："
+                        + "、".join(missing_local[:5])
+                        + ("…" if len(missing_local) > 5 else ""))
+            except Exception as exc:
+                rollback_installed(installed)
+                installed = []
+                result["reason"] = (
+                    f"对象迁入正式库失败，本批不发布，已撤回本批新增对象：{exc}。"
+                    "整批退回，仓库分支保持原状。")
+                return result
+
             lines = ["start"]
             for u in updates:
                 lines.append(f"update {HEADS_PREFIX}{u['branch']} "
@@ -315,14 +482,18 @@ def import_bundles(repo, files):
             proc = git(repo, "update-ref", "--stdin",
                        input_text="\n".join(lines) + "\n", check=False)
             if proc.returncode != 0:
+                rollback_installed(installed)
+                installed = []
                 result["reason"] = (
                     "更新分支失败（分支可能在验包期间被并发修改）："
-                    f"{proc.stderr.strip()}。整批退回，仓库分支保持原状。")
+                    f"{proc.stderr.strip()}。本批不发布，已撤回本批新增对象，"
+                    "仓库分支保持原状。")
                 return result
 
             result["ok"] = True
             result["updates"] = updates
             result["unchanged"] = unchanged
+            installed = []  # 发布成功，对象保留，finally 不再回滚
             return result
         except GitError as exc:
             result["reason"] = f"内部 git 操作失败：{exc}。整批退回。"
@@ -331,13 +502,8 @@ def import_bundles(repo, files):
             result["reason"] = f"内部错误：{exc!r}。整批退回。"
             return result
         finally:
-            if tmp_refs_created:
-                stale = git(repo, "for-each-ref", "--format=%(refname)",
-                            TMP_REFS_PREFIX, check=False).stdout.split()
-                if stale:
-                    git(repo, "update-ref", "--stdin",
-                        input_text="".join(f"delete {r}\n" for r in stale),
-                        check=False)
+            if installed:  # 走到异常兜底：尽力撤回本批新增的正式对象
+                rollback_installed(installed)
             shutil.rmtree(work, ignore_errors=True)
 
 

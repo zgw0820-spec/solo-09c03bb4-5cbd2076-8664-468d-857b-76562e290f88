@@ -7,6 +7,9 @@ services:
       REPO_PATH: /srv/repo.git        # 供部署使用的本地裸仓库
       SAMPLES_DIR: /samples/bundles   # 正常样例包（相互依赖）
       SAMPLES_BAD_DIR: /samples/bad   # 反例样例包（缺前置 / 分叉）
+      # 隔离验包目录与正式库同在 /srv 数据卷（同一文件系统），
+      # 迁入对象走硬链接复用，不写第二份 pack；跨文件系统才回退复制。
+      TMPDIR: /srv/tmp
     volumes:
       - repo-data:/srv                # 裸仓库持久化
       - ./samples:/samples:ro         # 样例仓库与样例包
