@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Git bundle 批量导入</title>
+<style>
+  body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+         max-width: 960px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+  h1 { font-size: 1.5rem; } h2 { font-size: 1.15rem; margin-top: 2rem; }
+  table { border-collapse: collapse; } td, th { border: 1px solid #ccc; padding: .3rem .6rem; }
+  code, .mono { font-family: ui-monospace, Consolas, monospace; font-size: .92em; }
+  .box { border: 1px solid #ccc; border-radius: 6px; padding: 1rem; margin-top: 1rem; }
+  .ok { border-color: #2c8c4c; background: #f0faf3; }
+  .fail { border-color: #b3352b; background: #fdf2f1; }
+  .muted { color: #666; } .err { color: #b3352b; }
+  button { padding: .4rem 1rem; }
+</style>
+</head>
+<body>
+<h1>Git bundle 批量导入</h1>
+<p class="muted">目标裸仓库：<code>{{ repo }}</code>　·　一次最多 {{ max_bundles }} 份包　·　只更新分支</p>
+
+{% if repo_error %}
+<p class="err">无法读取仓库：{{ repo_error }}</p>
+{% endif %}
+
+<h2>当前分支</h2>
+{% if branches %}
+<table>
+  <tr><th>分支</th><th>提交</th></tr>
+  {% for ref, sha in branches.items() %}
+  <tr><td>{{ ref.replace('refs/heads/', '') }}</td><td class="mono">{{ sha|short }}</td></tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="muted">（仓库暂无分支）</p>
+{% endif %}
+
+<h2>上传 bundle（至多 {{ max_bundles }} 份，可乱序）</h2>
+<form method="post" action="/import" enctype="multipart/form-data">
+  <input type="file" name="files" multiple required>
+  <button type="submit">校验并导入</button>
+</form>
+
+{% if samples or bad_samples %}
+<h2>使用仓库内置样例包</h2>
+<form method="post" action="/import-samples">
+  {% if samples %}
+  <p>正常样例（相互依赖，可全选验证自动排序）：</p>
+  {% for s in samples %}
+  <label><input type="checkbox" name="sample" value="{{ s }}"> {{ s }}</label><br>
+  {% endfor %}
+  {% endif %}
+  {% if bad_samples %}
+  <p>反例样例（用于演示退回，混入即整批退回）：</p>
+  {% for s in bad_samples %}
+  <label><input type="checkbox" name="sample" value="{{ s }}"> {{ s }}</label><br>
+  {% endfor %}
+  {% endif %}
+  <br><button type="submit">导入所选样例包</button>
+</form>
+{% endif %}
+
+{% if result %}
+<h2>处理结果</h2>
+<div class="box {{ 'ok' if result.ok else 'fail' }}">
+  {% if result.ok %}
+    <p><strong>✅ 导入成功。</strong></p>
+  {% else %}
+    <p><strong>❌ 整批退回。</strong>{{ result.reason }}</p>
+  {% endif %}
+
+  {% if result.order %}
+  <p>验包顺序（按前置提交排出）：</p>
+  <ol>
+    {% for item in result.order %}
+    <li>
+      <span class="mono">{{ item.file }}</span>
+      <ul>
+        <li>前置提交：
+          {% if item.prereqs %}
+            {% for sha, comment in item.prereqs %}
+              <code>{{ sha|short }}</code>{% if comment %}（{{ comment }}）{% endif %}
+            {% endfor %}
+          {% else %}无{% endif %}
+        </li>
+        <li>分支：
+          {% for ref, sha in item.refs.items() %}
+            <code>{{ ref }}</code> → <code>{{ sha|short }}</code>{% if not loop.last %}，{% endif %}
+          {% endfor %}
+        </li>
+        {% if item.ignored %}
+        <li class="muted">已忽略的非分支引用：
+          {% for ref in item.ignored %}<code>{{ ref }}</code>{% if not loop.last %}，{% endif %}{% endfor %}
+        </li>
+        {% endif %}
+      </ul>
+    </li>
+    {% endfor %}
+  </ol>
+  {% endif %}
+
+  {% if result.missing %}
+  <p>缺失的提交：</p>
+  <ul>
+    {% for fname, miss in result.missing.items() %}
+    <li><span class="mono">{{ fname }}</span> 缺少：
+      {% for sha, comment in miss %}
+        <code>{{ sha }}</code>{% if comment %}（{{ comment }}）{% endif %}
+      {% endfor %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+
+  {% if result.ok %}
+    {% if result.updates %}
+    <p>实际更新的分支：</p>
+    <table>
+      <tr><th>分支</th><th>原提交</th><th>新提交</th></tr>
+      {% for u in result.updates %}
+      <tr>
+        <td>{{ u.branch }}</td>
+        <td class="mono">{{ u.old|short if u.old else '（新分支）' }}</td>
+        <td class="mono">{{ u.new|short }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <p>所有涉及分支均已是最新，无需更新。</p>
+    {% endif %}
+    {% if result.unchanged %}
+    <p class="muted">未变化的分支：{{ result.unchanged|join('、') }}</p>
+    {% endif %}
+  {% endif %}
+</div>
+{% endif %}
+
+</body>
+</html>
